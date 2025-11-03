@@ -14,11 +14,10 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data as data
-import torchvision.transforms as transforms
 import torch.nn.functional as F
 
 import models.wideresnet as models
-import dataset.cifar10 as dataset
+from dataset import get_binary_datasets
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from tensorboardX import SummaryWriter
 
@@ -35,6 +34,8 @@ parser.add_argument('--manualSeed', type=int, default=0, help='manual seed')
 #Device options
 parser.add_argument('--gpu', default='0', type=str,help='id(s) for CUDA_VISIBLE_DEVICES')
 #Method options
+parser.add_argument('--dataset', default='cifar10', choices=['mnist', 'fashionmnist', 'svhn', 'cifar10', 'cifar100', 'stl10'],
+                    help='Dataset to use for binary MixMatch experiments')
 parser.add_argument('--n-labeled', type=int, default=250,help='Number of labeled data')
 parser.add_argument('--train-iteration', type=int, default=1024,help='Number of iteration per epoch')
 parser.add_argument('--out', default='result',help='Directory to output the result')
@@ -42,6 +43,8 @@ parser.add_argument('--alpha', default=0.75, type=float)
 parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
 parser.add_argument('--ema-decay', default=0.999, type=float)
+parser.add_argument('--pos-prior', default=0.5, type=float,
+                    help='Target positive class prior for dataset sampling')
 
 
 args = parser.parse_args()
@@ -64,19 +67,30 @@ def main():
     if not os.path.isdir(args.out):
         mkdir_p(args.out)
 
+    if not (0.0 <= args.pos_prior <= 1.0):
+        raise ValueError('Positive class prior must be between 0 and 1.')
+
     # Data
-    print(f'==> Preparing cifar10')
-    transform_train = transforms.Compose([
-        dataset.RandomPadandCrop(32),
-        dataset.RandomFlip(),
-        dataset.ToTensor(),
-    ])
+    print(f'==> Preparing {args.dataset} (binary classification)')
 
-    transform_val = transforms.Compose([
-        dataset.ToTensor(),
-    ])
+    train_labeled_set, train_unlabeled_set, val_set, test_set, num_classes, split_stats = get_binary_datasets(
+        args.dataset,
+        './data',
+        args.n_labeled,
+        args.pos_prior,
+        seed=args.manualSeed,
+    )
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    for split_name, stats in split_stats.items():
+        print('    {split}: total={total} pos={pos} neg={neg} prior={prior:.3f}'.format(
+            split=split_name,
+            total=stats.total,
+            pos=stats.positive,
+            neg=stats.negative,
+            prior=stats.prior,
+        ))
+
+    args.num_classes = num_classes
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -86,7 +100,7 @@ def main():
     print("==> creating WRN-28-2")
 
     def create_model(ema=False):
-        model = models.WideResNet(num_classes=10)
+        model = models.WideResNet(num_classes=args.num_classes)
         model = model.cuda()
 
         if ema:
@@ -109,7 +123,7 @@ def main():
     start_epoch = 0
 
     # Resume
-    title = 'noisy-cifar-10'
+    title = f'noisy-{args.dataset}-binary'
     if args.resume:
         # Load checkpoint.
         print('==> Resuming from checkpoint..')
@@ -208,7 +222,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         batch_size = inputs_x.size(0)
 
         # Transform label to one-hot
-        targets_x = torch.zeros(batch_size, 10).scatter_(1, targets_x.view(-1,1).long(), 1)
+        targets_x = torch.zeros(batch_size, args.num_classes).scatter_(1, targets_x.view(-1,1).long(), 1)
 
         if use_cuda:
             inputs_x, targets_x = inputs_x.cuda(), targets_x.cuda(non_blocking=True)
@@ -298,7 +312,8 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    top5 = AverageMeter()
+    compute_top5 = args.num_classes >= 5
+    top5 = AverageMeter() if compute_top5 else None
 
     # switch to evaluate mode
     model.eval()
@@ -317,27 +332,43 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
             loss = criterion(outputs, targets)
 
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
+            topk = (1, 5) if compute_top5 else (1,)
+            accs = accuracy(outputs, targets, topk=topk)
+            prec1 = accs[0]
             losses.update(loss.item(), inputs.size(0))
             top1.update(prec1.item(), inputs.size(0))
-            top5.update(prec5.item(), inputs.size(0))
+            if compute_top5 and top5 is not None and len(accs) > 1:
+                prec5 = accs[1]
+                top5.update(prec5.item(), inputs.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
             # plot progress
-            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                        batch=batch_idx + 1,
-                        size=len(valloader),
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        total=bar.elapsed_td,
-                        eta=bar.eta_td,
-                        loss=losses.avg,
-                        top1=top1.avg,
-                        top5=top5.avg,
-                        )
+            if compute_top5 and top5 is not None:
+                bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                            batch=batch_idx + 1,
+                            size=len(valloader),
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            total=bar.elapsed_td,
+                            eta=bar.eta_td,
+                            loss=losses.avg,
+                            top1=top1.avg,
+                            top5=top5.avg,
+                            )
+            else:
+                bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f}'.format(
+                            batch=batch_idx + 1,
+                            size=len(valloader),
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            total=bar.elapsed_td,
+                            eta=bar.eta_td,
+                            loss=losses.avg,
+                            top1=top1.avg,
+                            )
             bar.next()
         bar.finish()
     return (losses.avg, top1.avg)
